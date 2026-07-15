@@ -30,6 +30,47 @@ The framework is designed to improve testing efficiency, ensure firmware stabili
 
 ---
 
+## Test Cases Covered (Current Version)
+
+The current version of the framework validates the following firmware features:
+
+| Test | Description |
+|------|-------------|
+| Passcode | Configures and verifies the device passcode. |
+| SRID | Sets and validates the System Reference ID (SRID). |
+| Wi-Fi Configuration | Configures the device Wi-Fi, validates connectivity, and restores the original Wi-Fi configuration. |
+| SoftAP Configuration | Configures SoftAP SSID and password. |
+| Server Configuration | Verifies Server Type configuration. |
+| MQTT Configuration | Configures MQTT server parameters and validates MQTT connection status. |
+| MQTT Keep Alive | Configures and verifies the MQTT Keep Alive interval. |
+| MQTT Subscribe | Subscribes the device to an MQTT topic. |
+| MQTT Subscription List | Retrieves and validates the subscribed topic list. |
+| MQTT Unsubscribe | Removes an existing MQTT subscription. |
+| MQTT Will Message | Configures the MQTT Last Will message. |
+| MQTT Will Retrieval | Retrieves the configured MQTT Will message. |
+| MQTT Publish | Publishes data to an MQTT topic. |
+| MQTT Publish Retrieval | Retrieves the configured publish information. |
+| UDP Configuration | Configures UDP multicast IP, port, and status. |
+| Boot Delay | Configures Boot Delay, measures actual reboot delay, validates timing, and restores the default Boot Delay. |
+| Product Name | Configures and verifies the Product Name. |
+| Device Reboot | Initiates a reboot and validates successful recovery using reboot count and product response. |
+| NTP Settings | Retrieves the current NTP configuration. |
+| Network Type | Configures and validates the network type. |
+| OTA Secure | Enables and verifies OTA Secure mode. |
+| IP Type | Configures and validates DHCP/Static IP settings. |
+| UZID | Sets a temporary UZID, verifies authentication using the new UZID, restores the original UZID, and validates restoration. |
+| Reboot Log | Retrieves and validates the reboot counter. |
+| Authentication Path | Retrieves the configured authentication server path. |
+| Perform Authentication | Executes device authentication with the configured server. |
+| SoftAP Validation | Enables SoftAP, validates connectivity over SoftAP, restores original Wi-Fi, and verifies device accessibility. |
+| Board Details | Retrieves board information from the firmware. |
+| Maintenance Mode | Retrieves the current maintenance mode status. |
+| Touch Flow | Executes touch-specific commands when the device supports touch functionality. |
+| Network Reset | Performs a network configuration reset. |
+| Hard Reset | Performs a factory reset and validates device reset behavior. |
+
+---
+
 ## Technologies Used
 
 - Python 3.x
