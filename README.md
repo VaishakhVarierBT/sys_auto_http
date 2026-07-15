@@ -1,1 +1,2 @@
+*Objective of the project::*
 Develop a Python-based automated firmware validation framework for BuildTrack IoT devices that executes end-to-end functional and configuration test cases, validates device behavior after configuration changes and reboot cycles, and generates structured test reports with minimal manual intervention. The framework is designed to improve regression testing efficiency, ensure firmware stability across releases, and provide repeatable, consistent validation of firmware features.
