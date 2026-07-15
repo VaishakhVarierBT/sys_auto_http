@@ -75,9 +75,7 @@ The current version of the framework validates the following firmware features:
 
 - Python 3.x
 - Requests
-- Socket Programming
 - Subprocess
-- JSON
 - CSV
 - NetworkManager (`nmcli`)
 - Git
