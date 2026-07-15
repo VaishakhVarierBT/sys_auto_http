@@ -1,4 +1,4 @@
-# BuildTrack Firmware Automation Framework
+# BuildTrack Firmware Testing Automation Framework
 
 ## Objective
 
