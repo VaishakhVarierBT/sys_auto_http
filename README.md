@@ -2,7 +2,7 @@
 
 ## Objective
 
-Develop a Python-based automated firmware validation framework for BuildTrack IoT devices that executes system test cases, validates device behavior after configuration changes and reboot cycles, and generates structured test reports with minimal manual intervention.
+Develop a Python-based automated firmware validation framework for BuildTrack IoT devices that executes system test cases, validates device behavior after configuration changes and reboot cycles, and generates structured test reports (.csv and terminal output) with minimal manual intervention.
 
 The framework is designed to improve testing efficiency, ensure firmware stability across firmware releases, and provide repeatable and consistent validation of firmware features.
 
@@ -98,14 +98,16 @@ The current version of the framework validates the following firmware features:
 ---
 
 ## Current Limitations
+### Linux : 
+Several configuration parameters are currently hardcoded, limiting flexibility.
+Limited support for large-scale regression testing.
+Automatic IP assignment for the device within a specified network is not yet implemented.
 
-- Several configuration parameters are currently hardcoded, limiting flexibility.
-- Limited support for large-scale regression testing.
-- Device network configuration is partially manual.
-- Automatic IP assignment for the device within a specified network is not yet implemented.
-- Currently supports **Linux only**.
-- Windows support can be added in future releases by replacing Linux-specific networking utilities with platform-independent implementations.
-- Wi-Fi Configuration, SoftAP Validation, and Boot Delay Validation may not function correctly on Windows.
+### Windows :
+
+Windows is currently not supported.
+Windows support can be added in future releases by replacing Linux-specific networking utilities with platform-independent implementations.
+Wi-Fi Configuration, SoftAP Validation, and Boot Delay Validation rely on Linux networking utilities and therefore will not function correctly on Windows in the current implementation.
 
 ---
 
