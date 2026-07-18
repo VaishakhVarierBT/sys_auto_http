@@ -3,6 +3,7 @@ import time
 import re
 import csv
 import subprocess
+import socket
 from datetime import datetime
 import time
 import json
@@ -10,6 +11,19 @@ from getpass import getpass
 from wifi_manager_v11 import configure_wifi_v11
 from softap_manager_v11 import softap_enable_v11
 from bootdelay_manager import bootdelay_test
+from mqtt_manager import (
+    subscribe_topic,
+    unsubscribe_topic,
+    get_subs_list
+)
+from mqtt_publish_manager import (
+    publish_test,
+    get_publish_test
+)
+from mqtt_will_manager import (
+    set_will_test,
+    get_will_test
+)
 
 # =========================
 # LOGGING (NON-INTRUSIVE)
@@ -58,18 +72,44 @@ def normalize_mac(mac):
 # USER INPUT
 # =========================
 
-import socket
+def get_current_wifi():
+    try:
+        # Get active WiFi SSID
+        ssid = subprocess.check_output(
+            ["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"],
+            text=True
+        )
 
-# Original WiFi (used later by WiFi & SoftAP managers)
-while True:
-    ORIGINAL_WIFI_SSID = input("Enter Original WiFi SSID: ").strip()
+        ssid = next(
+            line.split(":")[1]
+            for line in ssid.splitlines()
+            if line.startswith("yes:")
+        )
 
-    if ORIGINAL_WIFI_SSID:
-        break
+        # Get saved password
+        password = subprocess.check_output(
+            [
+                "nmcli",
+                "-s",
+                "-g",
+                "802-11-wireless-security.psk",
+                "connection",
+                "show",
+                ssid,
+            ],
+            text=True,
+        ).strip()
 
-    print("❌ SSID cannot be empty")
+        return ssid, password
 
-ORIGINAL_WIFI_PASSWORD = getpass("Enter Original WiFi Password: ")
+    except Exception as e:
+        print(f"❌ Failed to get current WiFi details: {e}")
+        exit(1)
+
+
+ORIGINAL_WIFI_SSID, ORIGINAL_WIFI_PASSWORD = get_current_wifi()
+
+print(f"Current WiFi SSID : {ORIGINAL_WIFI_SSID}")
 
 # Device MAC
 while True:
@@ -264,10 +304,58 @@ def configure_softap():
     )
 
 def set_server():
-    return config_flow(
-        {"passcode": PASSCODE_NEW, "command": "config", "serverType": "5"},
-        {"serverType": "5"}
-    )
+
+    server_types = ["2", "5"]
+    observations = []
+
+    for server in server_types:
+
+        print(f"\nSetting Server Type = {server}")
+
+        #
+        # Configure server type
+        #
+        ok, obs = config_flow(
+            {
+                "passcode": PASSCODE_NEW,
+                "command": "config",
+                "serverType": server
+            },
+            {
+                "serverType": server
+            }
+        )
+
+        observations.append(f"ServerType {server}: {obs}")
+
+        if not ok:
+            return False, "\n\n".join(observations)
+
+        #
+        # Verify again using Product
+        #
+        product, lat = send_request({
+            "passcode": PASSCODE_NEW,
+            "command": "product"
+        })
+
+        if not product:
+            observations.append(f"ServerType {server}: Product command failed.")
+            return False, "\n\n".join(observations)
+
+        if str(product.get("serverType")) != server:
+            observations.append(
+                f"ServerType {server}: Verification failed "
+                f"(Expected={server}, Observed={product.get('serverType')})"
+            )
+            return False, "\n\n".join(observations)
+
+        observations.append(
+            f"ServerType {server}: Verified successfully "
+            f"(latency={lat}ms)"
+        )
+
+    return True, "\n\n".join(observations)
 
 def set_mqtt():
 
@@ -344,27 +432,48 @@ def set_product_name():
     )
 
 # MQTT ops
-def subscribe_topic():
-    res, lat = send_request({"passcode": PASSCODE_NEW, "command": "subscribe",
-                             "topic": f"{DEVICE_MAC}/status", "qos": "1"})
-    return res is not None, f"lat={lat}ms"
+def subscribe():
+    return subscribe_topic(
+        send_request,
+        get_reboot_log,
+        wait_for_reboot,
+        wait_product,
+        PASSCODE_NEW
+    )
 
-def unsubscribe_topic():
-    res, lat = send_request({"passcode": PASSCODE_NEW, "command": "unsubscribe",
-                             "topic": f"{DEVICE_MAC}/status"})
-    return res is not None, f"lat={lat}ms"
+
+def unsubscribe():
+    return unsubscribe_topic(
+        send_request,
+        get_reboot_log,
+        wait_for_reboot,
+        wait_product,
+        PASSCODE_NEW
+    )
+
 
 def get_subs():
-    res, lat = send_request({"passcode": PASSCODE_NEW, "command": "getSubsList"})
-    return res is not None, f"lat={lat}ms"
+    ok, subs = get_subs_list(
+        send_request,
+        PASSCODE_NEW
+    )
+
+    return (
+        ok,
+        json.dumps(subs, indent=4) if subs else "Failed to fetch subscriptions."
+    )
 
 def set_will():
-    res, lat = send_request({"passcode": PASSCODE_NEW, "command": "setWill"})
-    return res is not None, f"lat={lat}ms"
+    return set_will_test(
+        send_request,
+        PASSCODE_NEW
+    )
 
 def get_will():
-    res, lat = send_request({"passcode": PASSCODE_NEW, "command": "getWill"})
-    return res is not None, f"lat={lat}ms"
+    return get_will_test(
+        send_request,
+        PASSCODE_NEW
+    )
 
 def configure_ping():
     return config_flow(
@@ -422,20 +531,17 @@ def set_mqtt_alive():
     )
 
 def publish_topic():
-    res, lat = send_request({
-        "passcode": PASSCODE_NEW,
-        "command": "publish",
-        "topic": "test/topic",
-        "qos": "0"
-    })
-    return res is not None, f"lat={lat}ms"
+    return publish_test(
+        send_request,
+        PASSCODE_NEW
+    )
+
 
 def get_publish():
-    res, lat = send_request({
-        "passcode": PASSCODE_NEW,
-        "command": "getPublish"
-    })
-    return res is not None, f"lat={lat}ms"
+    return get_publish_test(
+        send_request,
+        PASSCODE_NEW
+    )
 
 def sensorscantime():
     res, lat = send_request({
@@ -680,9 +786,9 @@ def run_all():
         ("Server", set_server, "serverType=5"),
         ("MQTT & SetAuthPath", set_mqtt, "serverType=2"),
         ("MQTT Alive", set_mqtt_alive, "mqttSetAlive=60"),
-        ("Subscribe", subscribe_topic, "MQTT subscribe"),
-        ("GetSubs", get_subs, "Subs list"),
-        ("Unsubscribe", unsubscribe_topic, "MQTT unsubscribe"),
+        ("Subscribe", subscribe, "Topic subscribed and verified"),
+        ("GetSubsList", get_subs, "Subscription list"),
+        ("Unsubscribe", unsubscribe, "Topic removed and verified"),
         ("SetWill", set_will, "Will set"),
         ("GetWill", get_will, "Will get"),
         ("Publish", publish_topic, "Publish ok"),
