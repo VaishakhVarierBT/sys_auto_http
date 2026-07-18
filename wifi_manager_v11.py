@@ -100,17 +100,49 @@ def configure_wifi_v11(
             break
 
     if c == "1":
-        nets = _scan()
-        for i, (s, sig) in enumerate(nets, 1):
-            print(f"{i}. {s:30} {sig}%")
+
         while True:
-            try:
-                idx = int(input("Select: "))
-                if 1 <= idx <= len(nets):
-                    break
-            except:
-                pass
-        test_ssid = nets[idx - 1][0]
+
+            nets = _scan()
+
+            if not nets:
+                print("\n❌ No WiFi networks found.")
+            else:
+                print("\nAvailable WiFi Networks:")
+                for i, (s, sig) in enumerate(nets, 1):
+                    print(f"{i}. {s:30} {sig}%")
+
+            print("\nOptions:")
+            print("  [number] Select a network")
+            print("  R        Rescan")
+            print("  M        Enter SSID manually")
+            print("  Q        Cancel")
+
+            choice = input("Choice: ").strip().lower()
+
+            if choice == "r":
+                print("\nRescanning...\n")
+                time.sleep(2)
+                continue
+
+            elif choice == "m":
+                test_ssid = input("Test SSID: ").strip()
+                break
+
+            elif choice == "q":
+                return False, "WiFi selection cancelled.", device_ip
+
+            else:
+                try:
+                    idx = int(choice)
+                    if 1 <= idx <= len(nets):
+                        test_ssid = nets[idx - 1][0]
+                        break
+                except ValueError:
+                    pass
+
+                print("❌ Invalid selection.")
+
     else:
         test_ssid = input("Test SSID: ").strip()
 
