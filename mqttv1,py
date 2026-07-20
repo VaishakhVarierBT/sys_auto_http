@@ -1,0 +1,824 @@
+"""
+MQTT system-event test framework, with an HTTP bootstrap step.
+
+Flow:
+  1. Ask for the device MAC only (no SSID/passcode prompts).
+  2. Resolve the device on the local network via mDNS: BTWN_<last4ofMAC>.local
+     (same approach as the HTTP framework).
+  3. Over HTTP, send the "config" command that switches the device to
+     serverType 2 (HTTP+MQTT) and points it at the MQTT broker
+     (rnd-ms.buildtrack.in:1899, btmqtt/btmqtt123, setAuthPath).
+  4. Wait 25 seconds, then poll "product" over HTTP and confirm
+     mqttState == ["1","1"].
+  5. Only once that's confirmed does this script open its own MQTT
+     connection and run the full test sequence over MQTT (same suite as
+     before -- Passcode, SRID, SoftAP, Server, MQTT Alive, Subscribe,
+     GetSubs, Unsubscribe, SetWill, GetWill, Publish, GetPublish, UDP,
+     BootDelay, ProductName, Reboot, NTP, NetworkType, OTASecure, IPType,
+     UZID, RebootLog, GetAuth, PerformAuth, SoftAP Enable/Disable,
+     BoardDetail, GetMaintenance, TouchFlow, NetworkReset, FinalReset).
+
+Notes carried over from the previous version:
+  - "Server" test (later in the list) uses serverType "7" (HTTP+Wired+MQTT),
+    not "5", so MQTT stays alive for the rest of the run.
+  - "Publish" test intentionally keeps the publish topic at <MAC>/status so
+    it doesn't redirect replies away from what this script listens on.
+  - "NetworkReset" / "FinalReset" are last and are expected to end
+    connectivity -- that's the anticipated outcome, not a bug.
+  - Commands commented out in the reference HTTP script (Ping, SetAuth,
+    Sensor Scan Time, SetMaintenance) stay commented out here too.
+"""
+
+import re
+import json
+import time
+import threading
+import csv
+import socket
+from datetime import datetime
+
+import requests
+import paho.mqtt.client as mqtt
+
+# =========================
+# CONFIG
+# =========================
+BROKER = "rnd-ms.buildtrack.in"
+PORT = 443
+USERNAME = "btmqtt"
+PASSWORD = "btmqtt123"
+WS_PATH = "/mqtt"
+
+CMD_TIMEOUT = 5           # seconds to wait for a normal MQTT command reply
+REBOOT_POLL_TIMEOUT = 40  # seconds to wait for a reboot to complete
+BOOT_DELAY_TEST_VALUE = "10"
+
+HTTP_TIMEOUT = 5
+HTTP_RETRIES = 5
+HTTP_WAIT = 2
+MQTT_CONFIRM_WAIT = 25    # seconds to wait after sending MQTT config over HTTP
+
+CSV_FILE = "test_results.csv"
+TXT_FILE = "test_report.txt"
+
+# =========================
+# LOGGING (same format as the HTTP framework)
+# =========================
+def init_logs():
+    with open(CSV_FILE, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Timestamp", "Test", "Expected", "Observed", "Status"])
+    with open(TXT_FILE, "w") as f:
+        f.write("===== TEST REPORT (MQTT, HTTP-bootstrapped) =====\n\n")
+
+
+def log_csv(name, expected, observed, status):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(CSV_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([timestamp, name, expected, observed, status])
+
+
+def log_txt(name, expected, observed, status):
+    with open(TXT_FILE, "a") as f:
+        f.write(f"{name}\n")
+        f.write(f"Expected: {expected}\n")
+        f.write(f"Observed: {observed}\n")
+        f.write(f"Result: {status}\n")
+        f.write("----------------------------------------\n")
+
+
+def record(name, expected, observed, status):
+    """Log a result and also print it, used for steps outside the main
+    test loop (e.g. the HTTP bootstrap)."""
+    print(f"\n\u25b6 {name}")
+    print(f"{status}")
+    print(observed)
+    log_csv(name, expected, observed, status)
+    log_txt(name, expected, observed, status)
+
+
+# =========================
+# MAC INPUT (no passcode prompt needed -- passcode == MAC)
+# =========================
+def get_valid_mac():
+    pattern = r"^[0-9A-Fa-f]{12}$"
+    while True:
+        mac = input("Enter Device MAC (12 hex chars): ").strip()
+        if re.match(pattern, mac):
+            return mac.upper()
+        print("\u274c Invalid MAC. Example: 24DCC3F58EA8")
+
+
+MAC = get_valid_mac()
+PASSCODE = MAC
+TOPIC_PUB = f"{MAC}/system"
+TOPIC_SUB = f"{MAC}/status"
+
+# =========================
+# HTTP DISCOVERY (mDNS) -- same approach as the HTTP framework
+# =========================
+def discover_device_ip(mac):
+    hostname = f"BTWN_{mac[-4:]}.local"
+    print(f"\nSearching for device ({hostname})...")
+
+    while True:
+        try:
+            ip = socket.gethostbyname(hostname)
+            print("\n\u2705 Device Found")
+            print(f"Hostname : {hostname}")
+            print(f"IP       : {ip}")
+
+            confirm = input("\nContinue with this device? (Y/N): ").strip().lower()
+            if confirm == "y":
+                return ip
+
+            print("Aborted by user.")
+            raise SystemExit
+
+        except socket.gaierror:
+            retry = input("\u274c Device not found. Retry? (Y/N): ").strip().lower()
+            if retry != "y":
+                raise SystemExit
+            time.sleep(2)
+
+
+DEVICE_IP = discover_device_ip(MAC)
+DEVICE_URL = f"http://{DEVICE_IP}/system"
+HTTP_HEADERS = {"Content-Type": "application/json"}
+
+
+def send_http(payload, retries=HTTP_RETRIES, wait=HTTP_WAIT, timeout=HTTP_TIMEOUT):
+    for _ in range(retries):
+        try:
+            start = time.time()
+            r = requests.post(DEVICE_URL, json=payload, headers=HTTP_HEADERS, timeout=timeout)
+            latency = int((time.time() - start) * 1000)
+            if r.status_code == 200:
+                return r.json(), latency
+        except Exception as e:
+            print(f"\u26a0\ufe0f {e}")
+        time.sleep(wait)
+    return None, None
+
+
+def get_product_http():
+    return send_http({"passcode": PASSCODE, "command": "product"})
+
+
+# =========================
+# BOOTSTRAP: PUT DEVICE ON MQTT, OVER HTTP
+# =========================
+def bootstrap_mqtt_via_http():
+    print("\nConfiguring MQTT over HTTP...")
+
+    payload = {
+        "passcode": PASSCODE,
+        "command": "config",
+        "serverType": "2",
+        "mqttServerName": "rnd-ms.buildtrack.in",
+        "mqttServerPort": "1899",
+        "mqttUsername": "btmqtt",
+        "mqttPassword": "btmqtt123",
+        "setAuthPath": "https://rnd-ms.buildtrack.in/service/ota/v1/getFP/1/",
+    }
+
+    res, lat = send_http(payload)
+    if not res:
+        return False, "No response to MQTT config command over HTTP"
+
+    print(f"Waiting {MQTT_CONFIRM_WAIT} seconds for MQTT connection...")
+    time.sleep(MQTT_CONFIRM_WAIT)
+
+    product, _ = get_product_http()
+    if not product:
+        return False, "Unable to fetch product over HTTP after MQTT configuration"
+
+    mqtt_state = product.get("mqttState")
+    print(f"MQTT State : {mqtt_state}")
+
+    if mqtt_state == ["1", "1"]:
+        return True, f"MQTT Connected Successfully. config_lat={lat}ms | product={product}"
+
+    return False, f"MQTT Connection Failed. mqttState={mqtt_state} | product={product}"
+
+
+# =========================
+# MQTT SETUP (created only AFTER the HTTP bootstrap confirms mqttState=[1,1])
+# =========================
+response_event = threading.Event()
+last_response = None
+client = None
+
+
+def create_client():
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets")
+    c.username_pw_set(USERNAME, PASSWORD)
+    c.ws_set_options(path=WS_PATH)
+    c.tls_set()
+    return c
+
+
+def on_connect(c, userdata, flags, rc, properties=None):
+    print("\u2705 Connected:", rc)
+    c.subscribe(TOPIC_SUB)
+    print("\U0001F4E1 Subscribed:", TOPIC_SUB)
+
+
+def on_message(c, userdata, msg):
+    global last_response
+    try:
+        data = json.loads(msg.payload.decode())
+        last_response = data
+        response_event.set()
+    except Exception:
+        print("[RAW]", msg.payload.decode())
+
+
+def start_mqtt_client():
+    global client
+    client = create_client()
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(BROKER, PORT, 60)
+    client.loop_start()
+    time.sleep(2)
+
+
+# =========================
+# SEND + WAIT (mirrors the HTTP framework's send_request, over MQTT)
+# =========================
+def send_and_wait(payload, retries=3, wait=2, timeout=CMD_TIMEOUT):
+    global last_response
+    for attempt in range(retries):
+        last_response = None
+        response_event.clear()
+
+        start = time.time()
+        client.publish(TOPIC_PUB, json.dumps(payload))
+
+        if response_event.wait(timeout=timeout):
+            latency = int((time.time() - start) * 1000)
+            return last_response, latency
+
+        if attempt < retries - 1:
+            time.sleep(wait)
+
+    return None, None
+
+
+# =========================
+# PRODUCT + VERIFY
+# =========================
+def get_product():
+    return send_and_wait({"passcode": PASSCODE, "command": "product"})
+
+
+def verify_fields(expected):
+    res, lat = get_product()
+    if not res:
+        return False, "No response", lat
+
+    ok = True
+    for k, v in expected.items():
+        if str(res.get(k)) != str(v):
+            ok = False
+
+    return ok, str(res), lat
+
+
+def get_reboot_log():
+    res, lat = send_and_wait({"passcode": PASSCODE, "command": "rebootLog"})
+    if not res:
+        return None, lat
+    try:
+        return int(res.get("rebootCount", -1)), lat
+    except Exception:
+        return -1, lat
+
+
+# =========================
+# REBOOT DETECTION (MQTT)
+# =========================
+def wait_for_reboot(timeout=REBOOT_POLL_TIMEOUT):
+    start = time.time()
+    down = False
+    down_time = None
+
+    while time.time() - start < timeout:
+        res, _ = send_and_wait(
+            {"passcode": PASSCODE, "command": "product"}, retries=1, timeout=2
+        )
+        if res:
+            if down:
+                return True, round(time.time() - down_time, 2)
+        else:
+            if not down:
+                down = True
+                down_time = time.time()
+        time.sleep(1)
+
+    return False, 0
+
+
+def wait_product():
+    for _ in range(15):
+        res, _ = get_product()
+        if res:
+            return True, str(res)
+        time.sleep(2)
+    return False, "No response"
+
+
+# =========================
+# CORE FLOW (mirrors the HTTP framework's config_flow)
+# =========================
+def config_flow(payload, expected=None, expect_reboot=True):
+    before_count, _ = get_reboot_log()
+
+    _, config_lat = send_and_wait(payload)
+
+    if expect_reboot:
+        rebooted, dt = wait_for_reboot()
+        up, prod = wait_product()
+    else:
+        rebooted, dt, up, prod = True, 0, True, str(last_response)
+
+    after_count, _ = get_reboot_log()
+
+    reboot_ok = True
+    if expect_reboot:
+        reboot_ok = (
+            before_count is not None
+            and after_count is not None
+            and after_count > before_count
+        )
+
+    if expected:
+        ok, obs, verify_lat = verify_fields(expected)
+    else:
+        ok, obs, verify_lat = True, prod, 0
+
+    final = (
+        f"{obs} | reboot_dt={dt}s | "
+        f"rebootCount:{before_count}->{after_count} | "
+        f"config_lat={config_lat}ms | verify_lat={verify_lat}ms"
+    )
+
+    result_ok = ok and (not expect_reboot or (rebooted and up and reboot_ok))
+    return result_ok, final
+
+
+# =========================
+# TEST FUNCTIONS
+# =========================
+def set_passcode():
+    return config_flow({"passcode": PASSCODE, "command": "config", "setPasscode": PASSCODE})
+
+
+def set_srid():
+    return config_flow(
+        {"passcode": PASSCODE, "command": "config", "systemSrid": "123456789ABC"},
+        {"srID": "123456789ABC"},
+    )
+
+
+def configure_softap():
+    return config_flow(
+        {
+            "passcode": PASSCODE,
+            "command": "config",
+            "softapSsid": f"BTWN_{MAC[-4:]}",
+            "softapPassword": "123456789",
+        }
+    )
+
+
+def set_server():
+
+    observations = []
+
+    #
+    # Step 1
+    # Set serverType = 5 over MQTT
+    #
+    success, obs = config_flow(
+        {
+            "passcode": PASSCODE,
+            "command": "config",
+            "serverType": "5",
+        },
+        {
+            "serverType": "5",
+        },
+    )
+
+    observations.append(obs)
+
+    if not success:
+        return False, "\n".join(observations)
+
+    #
+    # Step 2
+    # Device is now in Wired mode.
+    # MQTT is expected to be unavailable.
+    #
+    observations.append(
+        "ServerType=5 verified. Reconnecting device to MQTT via HTTP bootstrap..."
+    )
+
+    #
+    # Step 3
+    # Reuse existing bootstrap function
+    #
+    success, boot_obs = bootstrap_mqtt_via_http()
+
+    observations.append(boot_obs)
+
+    if not success:
+        return False, "\n".join(observations)
+
+    #
+    # Step 4
+    # MQTT client on PC also reconnects
+    #
+    client.loop_stop()
+    client.disconnect()
+
+    start_mqtt_client()
+
+    observations.append("MQTT session restored successfully.")
+
+    return True, "\n".join(observations)
+
+
+def set_mqtt_alive():
+    return config_flow(
+        {"passcode": PASSCODE, "command": "config", "mqttSetAlive": "60"},
+        {"mqttSetAlive": "60"},
+    )
+
+
+def subscribe_topic():
+    res, lat = send_and_wait(
+        {"passcode": PASSCODE, "command": "subscribe", "topic": f"{MAC}/status", "qos": "1"},
+        retries=1,
+    )
+    if res is None:
+        return False, "No response to subscribe"
+
+    ok = res.get("status") == "success"
+
+    # PDF note: "After subscribing all of the topics that were required,
+    # we have to reboot the device."
+    print("\u26a0\ufe0f Rebooting to apply subscription...")
+    reboot_ok, reboot_obs = reboot()
+
+    return (ok and reboot_ok), f"subscribe={res} | reboot={reboot_obs}"
+
+
+def get_subs():
+    res, lat = send_and_wait({"passcode": PASSCODE, "command": "getSubsList"})
+    return res is not None, f"{res} | lat={lat}ms"
+
+
+def unsubscribe_topic():
+    res, lat = send_and_wait(
+        {"passcode": PASSCODE, "command": "unsubscribe", "topic": f"{MAC}/status"}
+    )
+    return res is not None, f"{res} | lat={lat}ms"
+
+
+def set_will():
+    res, lat = send_and_wait(
+        {
+            "passcode": PASSCODE,
+            "command": "setWill",
+            "status": "1",
+            "topic": "test/will",
+            "payload": "offline",
+            "qos": "1",
+            "retain": "1",
+        }
+    )
+    return res is not None, f"{res} | lat={lat}ms"
+
+
+def get_will():
+    res, lat = send_and_wait({"passcode": PASSCODE, "command": "getWill"})
+    return res is not None, f"{res} | lat={lat}ms"
+
+
+def publish_topic():
+    # Kept at the current default (<MAC>/status) on purpose: changing it to
+    # something else would redirect all further replies away from the
+    # topic this script listens on.
+    res, lat = send_and_wait(
+        {"passcode": PASSCODE, "command": "publish", "topic": f"{MAC}/status", "qos": "0"}
+    )
+    return res is not None, f"{res} | lat={lat}ms"
+
+
+def get_publish():
+    res, lat = send_and_wait({"passcode": PASSCODE, "command": "getPublish"})
+    return res is not None, f"{res} | lat={lat}ms"
+
+
+def configure_udp():
+    return config_flow(
+        {
+            "passcode": PASSCODE,
+            "command": "config",
+            "udpIp": "239.0.1.5",
+            "udpPort": "49152",
+            "udpStatus": "1",
+        }
+    )
+
+
+def set_boot_delay():
+    ok1, obs1 = config_flow(
+        {"passcode": PASSCODE, "command": "config", "bootDelay": BOOT_DELAY_TEST_VALUE},
+        {"bootDelay": BOOT_DELAY_TEST_VALUE},
+    )
+    ok2, obs2 = config_flow(
+        {"passcode": PASSCODE, "command": "config", "bootDelay": "1"}, {"bootDelay": "1"}
+    )
+    return (ok1 and ok2), f"set={obs1} | restore={obs2}"
+
+
+def set_product_name():
+    return config_flow(
+        {"passcode": PASSCODE, "command": "config", "productName": "Test_Device"},
+        {"productName": "Test_Device"},
+    )
+
+
+def reboot():
+    before_count, _ = get_reboot_log()
+
+    _, lat = send_and_wait({"passcode": PASSCODE, "command": "reboot"})
+
+    rebooted, dt = wait_for_reboot()
+    up, obs = wait_product()
+
+    after_count, _ = get_reboot_log()
+
+    reboot_ok = (
+        before_count is not None and after_count is not None and after_count > before_count
+    )
+
+    return rebooted and up and reboot_ok, (
+        f"{obs} | reboot_dt={dt}s | "
+        f"rebootCount:{before_count}->{after_count} | cmd_lat={lat}ms"
+    )
+
+
+def ntp_settings():
+    res, lat = send_and_wait({"passcode": PASSCODE, "command": "ntpSettings"})
+    return res is not None, f"{res} | lat={lat}ms"
+
+
+def set_network_type():
+    return config_flow(
+        {"passcode": PASSCODE, "command": "config", "networkType": "1"},
+        {"networkType": "1"},
+    )
+
+
+def set_ota_secure():
+    return config_flow(
+        {"passcode": PASSCODE, "command": "config", "otaSecure": "1"}, {"otaSecure": "1"}
+    )
+
+
+def configure_network_settings():
+    return config_flow(
+        {"passcode": PASSCODE, "command": "config", "ipType": "0"}, {"ipType": "0"}
+    )
+
+
+def set_uzid():
+    TEST_UZID = "112233445566"
+    print("\nSetting UZID...")
+
+    res, _ = send_and_wait(
+        {"passcode": PASSCODE, "command": "systemUzid", "value": TEST_UZID}
+    )
+    if not res:
+        return False, "Failed to set UZID."
+
+    print("Verifying new UZID...")
+    res, _ = send_and_wait({"passcode": TEST_UZID, "command": "product"})
+    if not res:
+        return False, "Product failed with new UZID."
+
+    print("Restoring original UZID...")
+    res, _ = send_and_wait(
+        {"passcode": TEST_UZID, "command": "systemUzid", "value": MAC}
+    )
+    if not res:
+        return False, "Failed to restore original UZID."
+
+    print("Verifying restored UZID...")
+    res, _ = send_and_wait({"passcode": MAC, "command": "product"})
+    if not res:
+        return False, "Original UZID verification failed."
+
+    return True, "UZID changed, verified and restored successfully."
+
+
+def reboot_log_test():
+    count, lat = get_reboot_log()
+    return count is not None, f"rebootCount={count} | lat={lat}ms"
+
+
+def get_auth():
+    res, lat = send_and_wait({"passcode": PASSCODE, "command": "getAuthPath"})
+    return res is not None, f"{res} | lat={lat}ms"
+
+
+def perform_auth():
+    res, lat = send_and_wait({"passcode": PASSCODE, "command": "performAuth"})
+    return res is not None, f"{res} | lat={lat}ms"
+
+
+def softap_enable_disable():
+    res1, lat1 = send_and_wait({"passcode": PASSCODE, "command": "softap", "value": "1"})
+    time.sleep(2)
+    res2, lat2 = send_and_wait({"passcode": PASSCODE, "command": "softap", "value": "0"})
+    ok = res1 is not None and res2 is not None
+    return ok, f"enable={res1}(lat={lat1}ms) | disable={res2}(lat={lat2}ms)"
+
+
+def get_board_detail():
+    res, lat = send_and_wait({"passcode": PASSCODE, "command": "getBoardDetail"})
+    return res is not None, f"{res} | lat={lat}ms"
+
+
+def get_maintenance():
+    res, lat = send_and_wait({"passcode": PASSCODE, "command": "getMaintenanceMode"})
+    return res is not None, f"{res} | lat={lat}ms"
+
+
+def touch_flow():
+    res, _ = get_product()
+    if not res:
+        return False, "No product response"
+
+    if "Touch" not in res.get("type", ""):
+        return True, "Skipped (not touch device)"
+
+    ok1, _ = send_and_wait(
+        {"passcode": PASSCODE, "command": "touchDelay", "delayTime": "50"}
+    )
+    ok2, _ = send_and_wait({"passcode": PASSCODE, "command": "getEnableTouchPin"})
+    ok3, _ = send_and_wait(
+        {
+            "passcode": PASSCODE,
+            "command": "enableTouchPin",
+            "params": ["1", "1", "1", "1", "1", "1"],
+        }
+    )
+
+    return (ok1 is not None and ok2 is not None and ok3 is not None), "Touch flow executed"
+
+
+def network_reset():
+    # This restores default network settings (SSID/password/IP). The device
+    # will very likely drop off Wi-Fi/MQTT after this -- that is expected.
+    res, lat = send_and_wait(
+        {"passcode": PASSCODE, "command": "reset", "value": "networkReset"}, retries=1
+    )
+    return res is not None, f"{res} | lat={lat}ms"
+
+
+def final_reset():
+    res, lat = send_and_wait(
+        {"passcode": PASSCODE, "command": "reset", "value": "hardReset"}, retries=1
+    )
+
+    print("Waiting for device to reset...")
+    time.sleep(8)
+
+    check, _ = send_and_wait(
+        {"passcode": PASSCODE, "command": "product"}, retries=1, timeout=3
+    )
+
+    if check is None:
+        return True, "Device unresponsive after hard reset (expected)"
+
+    return False, "Device still responding \u2192 reset may have failed"
+
+
+def write_device_info():
+    product, _ = get_product()
+    board, _ = send_and_wait({"passcode": PASSCODE, "command": "getBoardDetail"})
+
+    with open(TXT_FILE, "a") as f:
+        f.write("===== DEVICE INFORMATION =====\n\n")
+        f.write(f"Device MAC : {MAC}\n")
+        f.write(f"Device IP (used for HTTP bootstrap) : {DEVICE_IP}\n")
+
+        if product:
+            f.write(f"Product Type : {product.get('type', 'N/A')}\n")
+
+        f.write("\nProduct Response:\n")
+        f.write(json.dumps(product, indent=4))
+
+        f.write("\n\nBoard Detail Response:\n")
+        f.write(json.dumps(board, indent=4))
+
+        f.write("\n\n========================================\n\n")
+
+
+# =========================
+# RUNNER
+# =========================
+def run_all():
+    write_device_info()
+
+    tests = [
+        ("Passcode", set_passcode, "Passcode should be set"),
+        ("SRID", set_srid, "srID = 123456789ABC"),
+        ("SoftAP Config", configure_softap, "SoftAP configured"),
+        ("Server", set_server, "serverType=2,5 (MQTT kept alive)"),
+        ("MQTT Alive", set_mqtt_alive, "mqttSetAlive=60"),
+        ("Subscribe", subscribe_topic, "MQTT subscribe + reboot"),
+        ("GetSubs", get_subs, "Subs list"),
+        ("Unsubscribe", unsubscribe_topic, "MQTT unsubscribe"),
+        ("SetWill", set_will, "Will set"),
+        ("GetWill", get_will, "Will get"),
+        ("Publish", publish_topic, "Publish topic unchanged"),
+        ("GetPublish", get_publish, "Publish fetch"),
+        ("UDP", configure_udp, "UDP config"),
+        ("BootDelay", set_boot_delay, f"bootDelay={BOOT_DELAY_TEST_VALUE} then restore to 1"),
+        ("ProductName", set_product_name, "productName=Test_Device"),
+        # ("Ping", configure_ping, "Ping config"),
+        ("Reboot", reboot, "Device reboot"),
+        ("NTP", ntp_settings, "NTP response"),
+        ("NetworkType", set_network_type, "networkType=1"),
+        ("OTASecure", set_ota_secure, "otaSecure=1"),
+        ("IPType", configure_network_settings, "ipType=0"),
+        # ("Sensor Scan Time", sensorscantime, "badCommand expected"),
+        ("UZID", set_uzid, "UZID set"),
+        ("RebootLog", reboot_log_test, "rebootLog fetch"),
+        ("GetAuth", get_auth, "Auth path"),
+        ("PerformAuth", perform_auth, "Auth success"),
+        ("SoftAP Enable/Disable", softap_enable_disable, "SoftAP toggled"),
+        ("BoardDetail", get_board_detail, "Board info"),
+        ("GetMaintenance", get_maintenance, "Maintenance get"),
+        # ("SetMaintenance", set_maintenance, "Maintenance set"),
+        ("TouchFlow", touch_flow, "Touch test"),
+        ("NetworkReset", network_reset, "Network reset (connectivity loss expected)"),
+        ("FinalReset", final_reset, "Hard reset"),
+    ]
+
+    results = []
+
+    for name, func, expected in tests:
+        print(f"\n\u25b6 {name}")
+        start = time.time()
+
+        try:
+            success, obs = func()
+        except Exception as e:
+            success, obs = False, str(e)
+
+        total = round(time.time() - start, 2)
+        status = "PASS" if success else "FAIL"
+
+        print(f"{status} ({total}s)")
+        print(obs)
+
+        observed_full = f"{obs} | total_time={total}s"
+
+        log_csv(name, expected, observed_full, status)
+        log_txt(name, expected, observed_full, status)
+
+        results.append(
+            {"test_name": name, "observed": observed_full, "status": status, "time": total}
+        )
+
+    print("\n==== SUMMARY ====")
+    for r in results:
+        print(f"{r['test_name']}: {r['status']}")
+
+    client.loop_stop()
+
+
+if __name__ == "__main__":
+    init_logs()
+
+    # ---- Step 1: bring the device onto MQTT, over HTTP ----
+    boot_ok, boot_obs = bootstrap_mqtt_via_http()
+    boot_status = "PASS" if boot_ok else "FAIL"
+    record("MQTT Bootstrap (HTTP)", "mqttState=[1,1] within 25s of HTTP config", boot_obs, boot_status)
+
+    if not boot_ok:
+        print("\n\u274c Could not bring the device onto MQTT via HTTP. Aborting test run.")
+        raise SystemExit(1)
+
+    # ---- Step 2: switch to MQTT and run the rest of the suite ----
+    start_mqtt_client()
+    run_all()
